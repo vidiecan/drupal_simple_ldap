@@ -1,0 +1,1287 @@
+<?php
+/**
+ * @file
+ * Main simple_ldap_user module file.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function simple_ldap_user_menu() {
+  $items = array();
+
+  $items['admin/config/people/simple_ldap/user'] = array(
+    'title' => 'Users',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('simple_ldap_user_admin'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'simple_ldap_user.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 1,
+  );
+
+  $items['admin/config/people/simple_ldap/profile'] = array(
+    'title' => 'Profile',
+    'description' => 'Map user profile fields with LDAP user object',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('simple_ldap_user_profile_map_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'simple_ldap_user.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 10,
+  );
+
+  $items['admin/people/simple_ldap_user_import'] = array(
+    'title' => 'Import from LDAP',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('simple_ldap_user_import'),
+    'access arguments' => array('administer users'),
+    'file' => 'simple_ldap_user.admin.inc',
+    'type' => MENU_LOCAL_ACTION,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Overrides the built-in user module's list of users, setting accounts to
+ * "blocked" if there is no matching LDAP account.
+ */
+function simple_ldap_user_form_user_admin_account_alter(&$form, &$form_state, $form_id) {
+  // Update the user array.
+  foreach ($form['accounts']['#options'] as $uid => $user) {
+
+    // Don't mess with user/1.
+    if ($uid == 1) {
+      continue;
+    }
+
+    // Verify active users. Blocked users may be provisioned to LDAP when they
+    // are set to active, so they are left alone here.
+    if ($user['status'] == 'active') {
+      // Load the user objects.
+      $drupal_user = user_load($uid);
+      $ldap_user = SimpleLdapUser::singleton($drupal_user->name);
+
+      // Check whether the user exists in LDAP.
+      if (!$ldap_user->exists) {
+        $form['accounts']['#options'][$uid]['status'] = 'blocked';
+      }
+
+      // Check whether the user is disabled (Active Directory only).
+      // http://support.microsoft.com/kb/305144
+      if ($ldap_user->server->type == 'Active Directory') {
+        if (isset($ldap_user->useraccountcontrol[0]) && (int) $ldap_user->useraccountcontrol[0] & 2) {
+          $form['accounts']['#options'][$uid]['status'] = 'blocked';
+        }
+      }
+
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_info_alter().
+ *
+ * Specifies that SimpleLdapuserController should be used to load users instead
+ * of the default controller.
+ */
+function simple_ldap_user_entity_info_alter(&$entity_info) {
+  if (isset($entity_info['user'])) {
+    // Use the SimpleLdapUserController class to manage users.
+    $entity_info['user']['controller class'] = 'SimpleLdapUserController';
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function simple_ldap_user_form_alter(&$form, &$form_state, $form_id) {
+  switch ($form_id) {
+    case 'user_login_block':
+      // Remove the register and password reminder links.
+      $server = SimpleLdapServer::singleton();
+      if ($server->readonly) {
+        unset($form['links']);
+      }
+    case 'user_login':
+    case 'user_pass':
+      // Insert simple_ldap_user's username validation.
+      array_unshift($form['#validate'], 'simple_ldap_user_login_name_validate');
+      break;
+
+    case 'user_profile_form':
+      // Disable mapped fields if LDAP Server is read-only.
+      $server = SimpleLdapServer::singleton();
+      $attribute_map = simple_ldap_user_variable_get('simple_ldap_user_attribute_map');
+      $user_fields = simple_ldap_user_user_fields();
+
+      // Name, Mail, and Password are special attributes.
+      $form['account']['name']['#disabled'] = $server->readonly;
+      $form['account']['mail']['#disabled'] = $server->readonly;
+      $form['account']['pass']['#disabled'] = $server->readonly;
+
+      // Active Directory has some additional restrictions.
+      if ($server->type == 'Active Directory') {
+        $form['account']['name']['#disabled'] = TRUE;
+        $form['account']['pass']['#disabled'] = stripos($server->host, 'ldaps://') === FALSE;
+      }
+
+      // Other mapped fields.
+      foreach ($attribute_map as $ldap_attr_name => $drupal_fields) {
+        foreach ($drupal_fields as $index => $drupal_field_name) {
+          // Skip #delimeter and other special entries
+          if (!is_int($index)) {
+            continue;
+          }
+          switch ($user_fields[$drupal_field_name]['module']) {
+            case 'field':
+              // Use Field API.
+              $form[$drupal_field_name]['#disabled'] = $server->readonly;
+              break;
+
+            case 'user':
+              // Use the user object directly.
+              $form['account'][$drupal_field_name]['#disabled'] = $server->readonly;
+              break;
+
+            default:
+              watchdog('Simple LDAP', 'Can\'t disable field from unknown module %module. (not supported yet)', array('%module' => $field['module']), WATCHDOG_WARNING);
+          }
+        }
+      }
+      array_unshift($form['#validate'], 'simple_ldap_user_profile_form_validate');
+      break;
+
+    case 'user_register_form':
+      array_unshift($form['#validate'], 'simple_ldap_user_register_form_validate');
+      break;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_menu_alter().
+ *
+ * Disables the user register and password reminder pages if the LDAP server is
+ * read-only.
+ */
+function simple_ldap_user_menu_alter(&$items) {
+  $server = SimpleLdapServer::singleton();
+  if ($server->readonly) {
+    $items['user/register']['access callback'] = FALSE;
+    $items['user/password']['access callback'] = FALSE;
+  }
+}
+
+/**
+ * Implements hook_user_login().
+ *
+ * Fires when a user logs in.
+ *
+ * @param array $edit
+ *   The form values submitted by the user to log in,
+ *   including raw username and password.
+ */
+function simple_ldap_user_user_login(&$edit, $account) {
+  if (property_exists($account, 'uid') && ($account->uid == 1)) {
+    return;
+  }
+
+  $sync = simple_ldap_user_variable_get('simple_ldap_user_sync');
+  if ($sync == 'hook_user_login') {
+    switch (simple_ldap_user_variable_get('simple_ldap_user_source')) {
+      case 'ldap':
+        simple_ldap_user_sync_user_to_drupal($account);
+        break;
+
+      case 'drupal':
+        simple_ldap_user_sync_user_to_ldap($account);
+        break;
+    }
+  }
+}
+
+/**
+ * Implements hook_user_presave().
+ *
+ * Fires before an account is created or changed.
+ *
+ * @param array $edit
+ *   The form values submitted by the user.
+ */
+function simple_ldap_user_user_presave(&$edit, $account, $category) {
+  // Skip for UID 1 .
+  if (property_exists($account,'uid') && ($account->uid == 1)) { 
+    return;
+  }
+
+  // Do not overwrite the user status in the database.
+  if (isset($account->simple_ldap_user_drupal_status)) {
+    // If status is in the edit array, we need to be sure we're not
+    // unintentionally saving the LDAP value to the database. To check this, we
+    // see if $edit['status'] matches $account->status. If it does, set
+    // $edit['status'] to the simple_ldap_user_drupal_status value.
+    if (isset($edit['status']) && $edit['status'] == $account->status) {
+      $edit['status'] = $account->simple_ldap_user_drupal_status;
+    }
+    // Now set the $account->status back to the value in the database, just to
+    // be safe. This ensures that if $edit['status'] is empty, we don't mess up
+    // what's in the database with what is on the user object.
+    $account->status = $account->simple_ldap_user_drupal_status;
+  }
+  // To make sure we've covered all our bases, we also set $account->original's
+  // status back to what is in the database as well. This avoids Drupal sending
+  // account activation emails in user_save(), which it will do if it detects
+  // that the status has changed from $account->original to $account.
+  if (isset($account->original) && isset($account->original->simple_ldap_user_drupal_status)) {
+    $account->original->status = $account->original->simple_ldap_user_drupal_status;
+  }
+
+  if ($account->is_new && isset($edit['name'])) {
+    $ldap_user = SimpleLdapUser::singleton($edit['name']);
+
+    if ($ldap_user->exists) {
+      // Force an initial sync from LDAP to drupal.
+      $attribute_mail = simple_ldap_user_variable_get('simple_ldap_user_attribute_mail');
+
+      // Get the user's email address.
+      $edit['mail'] = $ldap_user->{$attribute_mail}[0];
+
+      // Get the remaining mapped attributes.
+
+      // Process the LDAP user to generate the edit array that gets passed to user_save();
+      simple_ldap_user_generate_edit_ldap_to_drupal($edit, $ldap_user, $account);
+    }
+  }
+
+  //If account updated and username changed, RDN default to drupal name and ldap
+  //entry already exists from elsewhere, reset new changed username to its previous value.
+  if (isset($account->original)) {
+
+    //New name edited or programmatically set ?
+    $new_username = '';
+    if (!empty($edit['name']) && strcasecmp($account->original->name, $edit['name']) != 0) {
+      $new_username = $edit['name'];
+    }
+    elseif (strcasecmp($account->original->name, $account->name) != 0) {
+      $new_username = $account->name;
+    }
+
+    if ($new_username) {
+
+      $ldap_user = SimpleLdapUser::singleton($new_username);
+      $attribute_rdn = simple_ldap_user_variable_get('simple_ldap_user_attribute_rdn');
+      if (empty($attribute_rdn) && $ldap_user->exists) {
+
+        $account->name = $account->original->name;
+        $edit['name'] = $account->original->name;
+        drupal_set_message(t('The new username %name could not be changed because a conflicting LDAP entry already exists. Previous names have been kept and no LDAP modification has been done.', array('%name' => $new_username)), 'error');
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_user_insert().
+ *
+ * Fires after a new account is created.
+ *
+ * @param array $edit
+ *   The form values submitted by the user.
+ */
+function simple_ldap_user_user_insert(&$edit, $account, $category) {
+  if ($account->uid == 1) { 
+    return;
+  }
+  
+  $ldap_user = SimpleLdapUser::singleton($account->name);
+  if (!$ldap_user->exists) {
+    module_invoke_all('sync_user_to_ldap', $account);
+
+    simple_ldap_user_update_authmap($account, $ldap_user);
+  }
+
+}
+
+function simple_ldap_user_update_authmap($account, $ldap_user=NULL) {
+  // Write out the PUID or the DN to the authmap
+  if (!$ldap_user) {
+    $ldap_user = SimpleLdapUser::singleton($account->name);
+  }
+  $puid_attr = strtolower(simple_ldap_user_variable_get('simple_ldap_user_unique_attribute'));
+  $puid_attr = ($puid_attr) ? $puid_attr : 'dn';
+  user_set_authmaps($account, array('authmap_simple_ldap' => $ldap_user->{$puid_attr}[0]));
+}
+
+/**
+ * Implements hook_user_update().
+ *
+ * Fires when a user account is edited.
+ *
+ * @param array $edit
+ *   The form values submitted by the user.
+ */
+function simple_ldap_user_user_update(&$edit, $account, $category) {
+  // Don't do anything for uid 1.
+  if ($account->uid == 1) {
+    return;
+  }
+
+  // Don't do anything if the hook was called via hook_sync_user_to_drupal().
+  if (empty($account->hook_sync_user_to_drupal)) {
+    $ldap_user = SimpleLdapUser::singleton($account->name);
+    $enabled = isset($edit['status']) ? $edit['status'] : NULL;
+    // In hook_user_presave, we may have messed with the $edit['status'] and
+    // $account->status values, setting them to the database values, not what
+    // LDAP had set status to. Set those back to the LDAP values now.
+    if (isset($account->simple_ldap_user_ldap_status)) {
+      $enabled = $account->status = $account->simple_ldap_user_ldap_status;
+    }
+    if ($enabled || $ldap_user->exists) {
+      module_invoke_all('sync_user_to_ldap', $account);
+    }
+  }
+  else {
+    unset($account->hook_sync_user_to_drupal);
+  }
+}
+
+/**
+ * Implements hook_user_delete().
+ *
+ * Fires when a user account is deleted, before account is
+ * deleted.
+ *
+ * @throw SimpleLdapException
+ */
+function simple_ldap_user_user_delete($account) {
+  if ($account->uid == 1) { 
+    return;
+  }
+
+  // Call hook_simple_ldap_user_delete so other modules can create customized delete behavior.
+  $ldap_user = SimpleLdapUser::singleton($account->name);
+  $user_altered = array_filter(module_invoke_all('simple_ldap_user_delete', $account, $ldap_user));
+  if (!empty($user_altered)) {
+    try {
+      $ldap_user->save();
+    } catch (SimpleLdapException $e) {
+      watchdog('Simple LDAP', 'Failed to save changes to @dn from hook_simple_ldap_user_delete().', array('@dn' => $ldap_user->dn, WATCHDOG_ERROR));
+    }
+  };
+
+  if (!simple_ldap_user_variable_get('simple_ldap_user_delete_from_ldap')) {
+    return;
+  }
+
+  try {
+    $ldap_user->delete();
+  } catch (SimpleLdapException $e) {
+    drupal_set_message(t('Failed to delete @name from LDAP.', array('@name' => $account->name)) . ' ' . t('Error @code: @message.', array('@code' => $e->getCode(), '@message' => $e->getMessage())), 'error', FALSE);
+  }
+}
+
+/**
+ * Implements hook_user_load().
+ *
+ * Fires when user information is being loaded from the database.
+ * User information is cached, so this does not fire every time
+ * a user object is handled.
+ */
+function simple_ldap_user_user_load($users) {
+  $sync = simple_ldap_user_variable_get('simple_ldap_user_sync');
+  $puid_attr = simple_ldap_user_variable_get('simple_ldap_user_unique_attribute');
+
+  if ($sync == 'hook_user_load') {
+    foreach ($users as $account) {
+      if ($account->uid == 1) {
+        continue;
+      }
+      switch (simple_ldap_user_variable_get('simple_ldap_user_source')) {
+        case 'ldap':
+          simple_ldap_user_sync_user_to_drupal($account);
+          break;
+
+        case 'drupal':
+          simple_ldap_user_sync_user_to_ldap($account);
+          break;
+      }
+    }
+  }
+}
+
+/**
+ * Return a list of user fields with attributes describing how to handle them.
+ */
+function simple_ldap_user_user_fields($reset = FALSE) {
+  static $user_fields = array();
+
+  // Static cache
+  if (!empty($user_fields) && !$reset) {
+    return $user_fields;
+  }
+
+  $user_fields = module_invoke_all('simple_ldap_user_fields');
+  drupal_alter('simple_ldap_user_fields', $user_fields);
+
+  return $user_fields;
+}
+
+/**
+ * return the base set of fields.
+ */
+function simple_ldap_user_simple_ldap_user_fields() {
+  $user_fields = array(
+    'name' => array(
+      'label' => t('Login'), 
+      'description' => t('The username of the user'),
+      'required' => TRUE,
+      'module' => 'user',
+      'field_name' => 'name',
+    ),
+    'pass' => array(
+      'label' => t('Password'), 
+      'description' => t('The user\'s password of the user'),
+      'required' => TRUE,
+      'module' => 'user',
+      'field_name' => 'pass',
+    ),
+    'mail' => array(
+      'label' => t('Email'), 
+      'description' => t('The user\'s email address'),
+      'required' => TRUE,
+      'module' => 'user',
+      'field_name' => 'mail',
+    ), 
+    'status' =>array(
+      'label' => t('Status'), 
+      'description' => t('Blocked or Active'),
+      'required' => FALSE,
+      'module' => 'user',
+      'field_name' => 'status',
+    ),
+    'created' => array(
+      'label' => t('Created Timestamp'), 
+      'description' => t('User registration time'),
+      'required' => FALSE,
+      'module' => 'user',
+      'field_name' => 'created',
+    ),
+    'login' => array(
+      'label' => t('Last Login Timestamp'), 
+      'description' => t('User most recent login timestamp'),
+      'required' => FALSE,
+      'module' => 'user',
+      'field_name' => 'login',
+    ),
+    'access' => array(
+      'label' => t('Last Access Timestamp'), 
+      'description' => t('Most recent visit timestamp'),
+      'required' => FALSE,
+      'module' => 'user',
+      'field_name' => 'access',
+    ),
+  );
+  if (variable_get('user_pictures', FALSE)) {
+    $user_fields['picture'] = array(
+      'label' => t('Picture'),
+      'required' => FALSE,
+      'description' => t('User headshot or avatar'),
+      'field_name' => 'picture',
+      'module' => 'user',
+    );
+  }
+  if (variable_get('user_signatures', FALSE)) {
+    $user_fields['signature'] = array(
+      'label' => t('Signature'),
+      'required' => FALSE,
+      'description' => t('Signature block'),
+      'field_name' => 'signature',
+      'module' => 'user',
+    );
+  }
+
+  // Pull entity fields for user records
+  $user_entity_fields = field_info_instances('user');
+  foreach ($user_entity_fields as $obj_key => $object) {
+    foreach($object as $key => $field) {
+      $user_fields[$key] = $field;
+      $user_fields[$key]['module'] = 'field';
+    }
+  }
+
+  return $user_fields;
+}
+
+/**
+ * Check the name and email both belong to the same LDAP account, or no 
+ * account at all.
+ */
+function simple_ldap_user_register_form_validate($form, &$form_state) {
+  $ldap_user_by_name = SimpleLdapUser::singleton($form_state['values']['name']);
+  $ldap_user_by_mail = SimpleLdapUser::singleton($form_state['values']['mail']);
+  $name_dn = $ldap_user_by_name->dn;
+  $mail_dn = $ldap_user_by_mail->dn;
+
+  if ($name_dn !== $mail_dn) {
+    if (empty($mail_dn)) {
+      form_set_error('name', t('A user with that username is already registered, but not with that email address.'));
+    }
+    else if (empty($name_dn)) {
+      form_set_error('mail', t('A user with that email address is already registered, but not with that user name.'));
+    }
+    else {
+      form_set_error('name', t('That username is already in use with a different email address.'));        
+    }
+  }
+}
+
+function simple_ldap_user_profile_form_validate($form, &$form_state) {
+  $ldap_user_by_name = SimpleLdapUser::singleton($form_state['values']['name']);
+  $ldap_user_by_mail = SimpleLdapUser::singleton($form_state['values']['mail']);
+  $account = $form_state['user'];
+  $ldap_user = SimpleLdapUser::singleton($account->name);
+
+  // Pull all three DNs
+  $name_dn = $ldap_user_by_name->dn;
+  $mail_dn = $ldap_user_by_mail->dn;
+  $user_dn = $ldap_user->dn;
+
+  // Make sure he doesn't collide with an existing LDAP user
+  if (!$ldap_user->exists) {
+    if ($ldap_user_by_name->exists) {
+      form_set_error('name', t('Another user has that username.'));
+    }
+    if ($ldap_user_by_mail->exists) {
+      form_set_error('mail', t('Another user has that email address.'));
+    }
+  }
+  else {
+    if (($user_dn !== $name_dn) && $ldap_user_by_name->exists) {
+      form_set_error('name', t('Another user has that username.'));
+    }
+    if (($user_dn !== $mail_dn) && $ldap_user_by_mail->exists) {
+      form_set_error('mail', t('Another user has that email address.'));
+    }
+  }
+}
+
+/**
+ * Validate the username on a login or password reset form.
+ */
+function simple_ldap_user_login_name_validate($form, &$form_state) {
+  // Get the username from the form data.
+  $name = trim($form_state['values']['name']);
+
+  if (simple_ldap_user_load_or_create_by_name($name) === NULL) {
+    form_set_error('name', t('An account ID conflict has been detected.  Please contact your site administrator.'));
+  }
+}
+
+/**
+ * Create a valid LDAP user on this site if they don't already exist.
+ *
+ * @param string $name
+ *   The username or email address to load.
+ *
+ * @return mixed
+ *   The Drupal user object, FALSE if the process failed, NULL if there was a conflict.
+ */
+function simple_ldap_user_load_or_create_by_name($name) {
+  // Load the LDAP user with the given username.
+  $ldap_user = SimpleLdapUser::singleton($name);
+  $attribute_name = strtolower(simple_ldap_user_variable_get('simple_ldap_user_attribute_name'));
+  $attribute_mail = strtolower(simple_ldap_user_variable_get('simple_ldap_user_attribute_mail'));
+  $puid_attr = strtolower(simple_ldap_user_variable_get('simple_ldap_user_unique_attribute'));
+
+  // If the user doesn't exist in LDAP, there is nothing for us to do.
+  if (!$ldap_user->exists) {
+    return FALSE;
+  }
+
+  // Pull the username
+  $user_name = $ldap_user->{$attribute_name}[0];
+  if ($puid_attr) {
+    $puid = $ldap_user->{$puid_attr}[0];
+    $puid_status = simple_ldap_user_update_username_for_puid($puid, $user_name);
+  
+    // Abort if there is a conflict.
+    if ($puid_status === FALSE) {
+      return NULL;
+    }
+
+    $name = $user_name;
+  }
+
+  // Attempt to load the drupal user.
+  $drupal_user = user_load_by_name($name);
+  if (!$drupal_user) {
+    $drupal_user = user_load_by_mail($name);
+  }
+
+  // If the user doesn't already exist in Drupal, create them.
+  if (!$drupal_user) {
+    $edit = array(
+      'name' => $ldap_user->{$attribute_name}[0],
+      'mail' => $ldap_user->{$attribute_mail}[0],
+      'status' => 1,
+    );
+    $drupal_user = user_save(NULL, $edit);
+    $authmap_attr = ($puid_attr) ? $puid_attr : 'dn';
+    user_set_authmaps($drupal_user, array('authmap_simple_ldap' => $ldap_user->{$authmap_attr}[0]));
+  }
+
+  return $drupal_user;
+}
+
+/**
+ * Check the authmaps for the PUID.  Update the {users} table if the PUID is present but the username is different.
+ * 
+ * @param $puid The unique attribute for the user.
+ *
+ * @param $user_name The name of the user in LDAP
+ * 
+ * @return FALSE if a name conflict exists
+ *    NULL if no user has the PUID or no PUID Attr has been set
+ *    TRUE if the user exists.
+ */
+function simple_ldap_user_update_username_for_puid($puid, $user_name) {
+  $puid_attr = strtolower(simple_ldap_user_variable_get('simple_ldap_user_unique_attribute'));
+  if (!$puid_attr) {
+    return NULL;
+  }
+
+  // Look for the user in the authmaps.
+  $drupal_user_map = db_query("SELECT u.name, u.uid FROM {users} u INNER JOIN {authmap} a ON u.uid = a.uid WHERE a.module='simple_ldap' AND a.authname=:authname", array(':authname' => $puid))->fetchAssoc();
+
+  // No entry, return NULL
+  if (empty($drupal_user_map)) {
+    return NULL;
+  }
+
+  // If there is an authmap entry, make sure the username matches or is empty.
+  if ($drupal_user_map['name'] != $user_name) {
+
+    // Name has changed, make sure the new name isn't already in use.
+    $conflicting_user = db_query("SELECT u.uid FROM {users} u WHERE u.name=:name", array(':name' => $user_name))->fetchAssoc();
+
+    if ($conflicting_user) {
+      watchdog('Simple LDAP', 'User %username (UID @uid) used to have login %oldname was renamed, but another user already has that name.', 
+        array('%username' => $user_name, '@uid' => $conflicting_user['uid'], '%oldname' => $drupal_user_map['name']), WATCHDOG_ERROR);
+      return FALSE;
+    }
+
+    // Update the username record directly so user_load_by_name() will find it.
+    watchdog('Simple LDAP', 'User @uid was externally renamed from %oldname to %newname.', 
+      array('@uid' => $drupal_user_map['uid'], '%oldname' => $drupal_user_map['name'], '%newname' => $user_name), WATCHDOG_NOTICE);
+    db_query("UPDATE {users} SET name=:newname WHERE uid=:uid", array(':newname' => $user_name, ':uid' => $drupal_user_map['uid']));
+  }
+
+  return TRUE;
+}
+
+/**
+ * Implements HOOK_simple_ldap_data_handlers()
+ */
+function simple_ldap_user_simple_ldap_data_handlers() {
+  $handlers_file = drupal_get_path('module', 'simple_ldap_user') . '/simple_ldap_user.ldap_handlers.inc';
+
+  $handlers = array(
+    'text' => array(
+      'import_callback' => 'simple_ldap_user_translate_basic_ldap_to_drupal',
+      'export_callback' => 'simple_ldap_user_translate_basic_drupal_to_ldap',
+      'file' => $handlers_file,
+    ),
+    'file' => array(
+      'import_callback' => 'simple_ldap_user_translate_file_ldap_to_drupal',
+      'export_callback' => 'simple_ldap_user_translate_file_drupal_to_ldap',
+      'file' => $handlers_file,
+    ),
+    'taxonomy_term_reference' => array(
+      'import_callback' => 'simple_ldap_user_translate_term_ldap_to_drupal',
+      'export_callback' => 'simple_ldap_user_translate_term_drupal_to_ldap',
+      'file' => $handlers_file,
+    ),
+    'url' => array(
+      'import_callback' => 'simple_ldap_user_translate_url_ldap_to_drupal',
+      'export_callback' => 'simple_ldap_user_translate_url_drupal_to_ldap',
+      'file' => $handlers_file,
+    ),
+    'datetime' => array(
+      'import_callback' => 'simple_ldap_user_translate_datetime_ldap_to_drupal',
+      'export_callback' => 'simple_ldap_user_translate_datetime_drupal_to_ldap',
+      'file' => $handlers_file,
+    ),
+    '#default' => array(
+      'import_callback' => 'simple_ldap_user_default_import_handler',
+      'export_callback' => 'simple_ldap_user_default_export_handler',
+      'file' => $handlers_file,
+    ),
+  );
+
+  // Some field types have similar structure
+  $handlers['number_integer'] = $handlers['text'];
+  $handlers['text_long'] = $handlers['text'];
+  $handlers['list_text'] = $handlers['text'];
+  $handlers['image']  = $handlers['file'];
+  return $handlers;
+}
+
+/**
+ * Translate Drupal fields into a format suitable for LDAP.
+ * 
+ * Invokes HOOK_simple_ldap_field_alter() to handle any fields that are
+ * not simple strings copied out to LDAP.
+ * 
+ */
+function simple_ldap_user_translate_drupal_attr_to_ldap(&$value, $account, $attr) {
+  $handlers = simple_ldap_user_get_data_handlers();
+  $field_info = field_info_field($attr);
+
+  if (!empty($field_info['type'])) {
+    // Get the value using Field API.
+    $items = field_get_items('user', $account, $attr);
+    $handler = (array_key_exists($field_info['type'], $handlers)) ? $handlers[$field_info['type']] : $handlers['#default'];
+    if (!empty($handler['file'])) {
+      require_once $handler['file'];
+    }
+    $handler['export_callback']($value, $field_info, $items);
+  }
+}
+
+/**
+ * Call HOOK_simple_ldap_data_handlers(), cache the results.
+ *
+ * @param boolean $reset
+ *   Reset the cache and recollect the list of handlers.
+ */
+function simple_ldap_user_get_data_handlers($reset = FALSE) {
+  static $handlers = array();
+
+  if (empty($handlers) || $reset) {
+    $handlers = module_invoke_all('simple_ldap_data_handlers');
+    drupal_alter('simple_ldap_data_handlers', $handlers);
+  }
+
+  return $handlers;
+}
+
+/**
+ * Translate a single LDAP Attribute to the mapped Drupal user entity field.
+ */
+function simple_ldap_user_translate_ldap_attr_to_drupal(&$edit, $account, $ldap_attr_data, $drupal_field) {
+  $items = field_get_items('user', $account, $drupal_field);
+  $info = field_info_field($drupal_field);
+  $language = field_language('user', $account, $drupal_field);
+
+  $handlers = simple_ldap_user_get_data_handlers();
+  $field_type = $info['type'];
+
+  $handler = (array_key_exists($field_type, $handlers)) ? $handlers[$field_type] : $handlers['#default'];
+  if (!empty($handler['file'])) {
+    require_once $handler['file'];
+  }
+  $handler['import_callback']($edit, $info, $items, $ldap_attr_data, $language);
+}
+
+/**
+ * Convert a field defined by the user module to a format suitable for LDAP
+ *
+ * @param array $ldap_edit
+ *    An array of values to be handed to LDAP.  Similar in function to user_save()'s $edit
+ *    parameter, but different in syntax.
+ *
+ * @param object $account
+ *    The Drupal user object being written to LDAP
+ *
+ * @param string $drupal_field_name
+ *    The name of the field to be converted.
+ */
+function simple_ldap_user_base_field_to_ldap(&$ldap_edit, $account, $drupal_field_name) {
+  $ldap_user = SimpleLdapUser::singleton($account->name);
+
+  switch ($drupal_field_name) {
+    case 'access':
+    case 'login':
+    case 'created':
+      if (!empty($account->{$drupal_field_name})) {
+        $tz = date_default_timezone_get();
+        date_default_timezone_set('UTC');
+        $ldap_edit[] = date('YmdHis', $account->$drupal_field_name) . 'Z';
+        date_default_timezone_set($tz);
+      }
+      break;
+    case 'picture':
+      if (is_object($account->picture)) {
+        $file = $account->picture;
+      }
+      else {
+        $file = file_load(empty($account->picture) ? 0 : $account->picture);
+      }
+      if (!empty($file)) {
+        $ldap_edit[] = file_get_contents($file->uri);
+      }
+      break;
+    case 'status':
+      $status = (property_exists($account, 'simple_ldap_user_drupal_status')) ? $account->simple_ldap_user_drupal_status : $account->status;
+      $ldap_edit[] = ($status) ? "1" : "0";
+      break;
+    default:
+      $ldap_edit[] = $account->$drupal_field_name;
+  }
+}
+
+function simple_ldap_user_base_field_to_drupal(&$edit, $drupal_user, $ldap_values, $drupal_field_name) {
+  @$ldap_value = $ldap_values[0];
+  switch ($drupal_field_name) {
+    case 'access':
+    case 'login':
+    case 'created':
+      // Never overwrite timestamps with NULL from a missing attribute
+      if ($ldap_value === NULL) {
+        if (!empty($drupal_user->{$drupal_field_name})) {
+          $edit['#ignored'][] = $drupal_field_name;
+        }
+        break;
+      }
+      // translate timestamp
+      $tz = date_default_timezone_get();
+      $timestamp = strtotime($ldap_value);
+      // Bad data?  Report, but don't copy.
+      if ($timestamp === FALSE) {
+        watchdog('SimpleLDAP', 'Invalid data trying to map LDAP to @drupal_field for user UID @user.', 
+          array(
+            '@drupal_field' => $drupal_field_name,
+            '@user' => $drupal_user->uid,
+          ),
+        WATCHDOG_WARNING);
+        break;
+      }
+
+      if (!property_exists($drupal_user, $drupal_field_name)) {
+        $edit[$drupal_field_name] = $timestamp;
+      }
+      else {
+        if ($drupal_user->{$drupal_field_name} > $timestamp) {
+          $edit['#ignored'][] = $drupal_field_name;
+        }
+        $edit[$drupal_field_name] = max($timestamp, $drupal_user->{$drupal_field_name});
+      }
+      date_default_timezone_set($tz);
+      break;
+
+    case 'picture':
+      @$drupal_image = $drupal_user->$drupal_field_name;
+
+      // Skip if both are empty
+      if (empty($drupal_image) && empty($ldap_value)) {
+        break;
+      }
+
+      // Skip if both are identical
+      if (!empty($drupal_image) && 
+          ($drupal_image->filesize == strlen($ldap_value)) &&
+          (md5($ldap_value) == md5(file_get_contents($drupal_image->uri)))
+        ) {
+        break;
+      }
+
+      // Otherwise, create a FID
+      $name_field = simple_ldap_user_variable_get('simple_ldap_user_attribute_name');
+      $filename = file_default_scheme() . '://' . variable_get('user_picture_path', 'pictures') . '/' . preg_replace('/\W+/', '_', $drupal_user->name) . '.jpg';
+      $file_obj = file_save_data($ldap_value, $filename, FILE_EXISTS_RENAME);
+      $edit[$drupal_field_name] = $file_obj;
+      break;
+
+    case 'status':
+      $status = (empty($ldap_value) || ($ldap_value == 'FALSE')) ? 0 : 1;
+      if (!property_exists($drupal_user, 'status') || ($drupal_user->status != $status)) {
+        $edit['status'] = $status;
+      }
+      break;
+
+    // All plain string fields fall to here.
+    default:
+      if (
+          isset($ldap_value) && 
+          (!property_exists($drupal_user, $drupal_field_name) || ($drupal_user->$drupal_field_name != $ldap_value))
+         ) {
+        $edit[$drupal_field_name] = $ldap_value;
+      }
+  }
+}
+
+/**
+ * Synchronizes Drupal user properties to LDAP.
+ */
+function simple_ldap_user_sync_user_to_ldap($drupal_user) {
+  // Don't try to sync anonymous or user 1.
+  if ($drupal_user->uid == 0 || $drupal_user->uid == 1) {
+    return;
+  }
+
+  // Don't try to sync if the server is read-only.
+  $server = SimpleLdapServer::singleton();
+  if ($server->readonly) {
+    return;
+  }
+
+  // simple_ldap_user configuration.
+  $user_fields = simple_ldap_user_user_fields();
+  $attribute_map = simple_ldap_user_variable_get('simple_ldap_user_attribute_map');
+
+  // Load the LDAP user.  If $drupal_user->orignal is set, this may be a move. Use the old name.
+  $search_name = (!empty($drupal_user->original)) ? $drupal_user->original->name : $drupal_user->name;
+  $ldap_user = SimpleLdapUser::singleton($search_name);
+
+  // Synchronize the fields in the attribute map.
+  foreach ($attribute_map as $ldap_attr_name => $drupal_fields) {
+
+    // Initialize the Drupal value array.
+    $drupal_values = array();
+
+    // Parse the drupal attribute name.
+    foreach ($drupal_fields as $drupal_field_name) {
+      // Get the Drupal value(s) based on the field type.
+      if (!array_key_exists($drupal_field_name, $user_fields)) {
+        continue;
+      }
+
+      switch ($user_fields[$drupal_field_name]['module']) {
+        case 'field':
+          simple_ldap_user_translate_drupal_attr_to_ldap($drupal_values, $drupal_user, $drupal_field_name);
+          break;
+
+        case 'user':
+          // Get the value directly from the user object.
+          simple_ldap_user_base_field_to_ldap($drupal_values, $drupal_user, $drupal_field_name);
+          break;
+
+        default:
+          watchdog('Simple LDAP', 'Field from unknown module %module. (not supported yet)', array('%module' => $field['module']), WATCHDOG_WARNING);
+      }
+    }
+    // Finally, add the values to the LDAP user.
+    if (!empty($drupal_fields['#delimiter'])) {
+      $drupal_values = implode($drupal_fields['#delimiter'], $drupal_values);
+    }
+
+    $ldap_user->{$ldap_attr_name} = $drupal_values;
+  }
+
+  // Set the DN.
+  $attribute_rdn = simple_ldap_user_variable_get('simple_ldap_user_attribute_rdn');
+  if (empty($attribute_rdn)) {
+    $attribute_rdn = simple_ldap_user_variable_get('simple_ldap_user_attribute_name');
+  }
+  if ($ldap_user->{$attribute_rdn}['count'] > 0) {
+    if ($ldap_user->dn) {
+      // Reconstruct an existing DN.
+      $parts = SimpleLdap::ldap_explode_dn($ldap_user->dn);
+      $basedn = '';
+      for ($i = 1; $i < $parts['count']; $i++) {
+        $basedn .= ',' . $parts[$i];
+      }
+    }
+    else {
+      // Default to using the configured basedn.
+      $basedn = ',' . simple_ldap_user_variable_get('simple_ldap_user_basedn');
+    }
+    $ldap_user->dn = $attribute_rdn . '=' . $ldap_user->{$attribute_rdn}[0] . $basedn;
+  }
+
+  // Allow altering the LDAP user object before saving.
+  drupal_alter('simple_ldap_user_to_ldap', $drupal_user, $ldap_user);
+
+  // Save any changes.
+  try {
+    $ldap_user->save();
+  } catch (SimpleLdapException $e) {
+    drupal_set_message(t('Failed to save the user to LDAP.') . ' ' . format_string('%error', array('%error' => $e->getMessage())), 'error');
+  }
+}
+
+/**
+ * Synchronizes LDAP attributes to Drupal user properties.
+ */
+function simple_ldap_user_sync_user_to_drupal($drupal_user) {
+  // Skip UID 1
+  if (property_exists($drupal_user, 'uid') && ($drupal_user->uid == 1)) {
+    return;
+  }
+
+  // Load the LDAP user, force a cache reset.
+  $ldap_user = SimpleLdapUser::singleton($drupal_user->name, TRUE);
+
+  // Nothing to sync.
+  if (!$ldap_user->exists) {
+    return;
+  }
+
+  // Initialize array of attribute changes.
+  $edit = array();
+
+  // Process the LDAP user to generate the edit array that gets passed to user_save();
+  simple_ldap_user_generate_edit_ldap_to_drupal($edit, $ldap_user, $drupal_user);
+
+  // Save any changes.
+  if (!empty($edit)) {
+    if (!isset($drupal_user->original)) {
+      // This avoids an infinite load/save loop.
+      $drupal_user->original = clone $drupal_user;
+    }
+    $drupal_user->hook_sync_user_to_drupal = TRUE;
+    $drupal_user = user_save($drupal_user, $edit);
+
+    // If any conversion added a #ignored tag, that means
+    // the Drupal values of some fields were not replaced 
+    // by values from the LDAP record and need to be written
+    // back to the LDAP server.  Used by the timestamps to
+    // ensure the latest values hold in both.
+    if (!empty($edit['#ignored'])) {
+      simple_ldap_user_sync_user_to_ldap($drupal_user);
+    }
+  }
+
+  // Synchronized user.
+  return $drupal_user;
+}
+
+function simple_ldap_user_generate_edit_ldap_to_drupal(&$edit, $ldap_user, $account) {
+  $attribute_map = simple_ldap_user_variable_get('simple_ldap_user_attribute_map');
+  $user_fields = simple_ldap_user_user_fields();
+
+  // Synchronize the fields in the attribute map.
+  foreach ($attribute_map as $ldap_attr => $drupal_fields) {
+    // Skip drupal-to-ldap many-to-one mappings.
+
+    $one_to_many = FALSE;
+    $values = array();
+    if (count($drupal_fields) > 2) {
+      if (array_key_exists('#delimiter', $drupal_fields)) {
+        if (array_key_exists(0, $ldap_user->{$ldap_attr})) {
+          $values = explode($drupal_fields['#delimiter'], $ldap_user->{$ldap_attr}[0]);
+        }
+        $values['count'] = count($values);
+        $one_to_many = TRUE;
+      }
+    }
+    else {
+      $values = $ldap_user->$ldap_attr;
+    }
+
+    foreach($drupal_fields as $key => $drupal_field_name) {
+      // Skip special items like #delimeter
+      if (!is_int($key)) {
+        continue;
+      }
+
+      // Skip the password field
+      if ($drupal_field_name == 'pass') {
+        continue;
+      }
+
+      // Skip if not in user field list
+      if (!array_key_exists($drupal_field_name, $user_fields)) {
+        continue;
+      }
+
+      // Map one at a time if mapping across multiple fields
+      // TODO: $values may not have enough entries. 
+      if ($one_to_many) {
+        $map_values = (array_key_exists($key, $values)) ? array($values[$key], 'count' => 1) : array('count' => 0);
+      }
+      else {
+        $map_values = $values;
+      }
+
+      $field = $user_fields[$drupal_field_name];
+      switch ($field['module']) {
+
+        // Update the value in drupal using Field API.
+        case 'field':
+          // Get the Drupal field values and metadata.
+          simple_ldap_user_translate_ldap_attr_to_drupal($edit, $account, $map_values, $drupal_field_name);
+          break;
+
+        // Update the value directly on the user object.
+        case 'user':
+          simple_ldap_user_base_field_to_drupal($edit, $account, $map_values, $drupal_field_name);
+          break;
+
+        default:
+          watchdog('Simple LDAP', 'Field from unknown module %module. (not supported yet)', array('%module' => $field['module']), WATCHDOG_WARNING);
+      }
+    }
+  }
+
+  // Allow altering the Drupal user object before saving.
+  drupal_alter('simple_ldap_user_to_drupal', $edit, $account, $ldap_user);
+}
+
+/**
+ * Implements hook_user_operations().
+ */
+function simple_ldap_user_user_operations() {
+  $operations = array();
+  $server = SimpleLdapServer::singleton();
+  if (!$server->readonly) {
+    $operations['simple_ldap_user_export'] = array(
+      'label' => t('Export selected users to LDAP'),
+      'callback' => 'simple_ldap_user_export',
+    );
+  }
+  return $operations;
+}
+
+/**
+ * Handles bulk user export from admin/people.
+ */
+function simple_ldap_user_export($users) {
+  // Generate the batch operation array.
+  $operations = array();
+  foreach ($users as $uid) {
+    // Don't sync user1.
+    if ($uid == 1) {
+      continue;
+    }
+
+    $operations[] = array('simple_ldap_user_export_user', array($uid));
+  }
+
+  $batch = array(
+    'operations' => $operations,
+  );
+
+  batch_set($batch);
+}
+
+/**
+ * Batch process function for mass user export.
+ * &$context comes from batch_set().
+ */
+function simple_ldap_user_export_user($uid, &$context) {
+  // Sync user to LDAP.
+  $account = user_load($uid);
+  simple_ldap_user_sync_user_to_ldap($account);
+  simple_ldap_user_update_authmap($account);
+  unset($account);
+}
+
+function simple_ldap_user_parent_objectclasses($classes) {
+  if (!is_array($classes)) {
+    $classes = array($classes);
+  }
+
+  // Pull the available LDAP schemas from the server
+  $server = SimpleLdapServer::singleton();
+  $schema = $server->schema;
+
+  foreach ($classes as $class) {
+    if (empty($class)) {
+      continue;
+    }
+    $result[] = $class;
+    $result = array_merge($result, $schema->superclass($class, TRUE));
+  }
+
+  return array_unique(array_map('strtolower', $result));
+}
+
+/**
+ * Returns the value for the specified variable.
+ *
+ * This function takes into account the configured LDAP server type, and
+ * attempts to determine a reasonable default value to try to use in the event
+ * that the module has not yet been configured.
+ */
+function simple_ldap_user_variable_get($name, $default = NULL, $force_default = FALSE) {
+  // Cache certain variables
+  static $cache = array();
+
+  // Allow variable name shorthand by prepending 'simple_ldap_user_' to $name if
+  // it is not already there.
+  if (strpos($name, 'simple_ldap_user_') !== 0) {
+    $name = 'simple_ldap_user_' . $name;
+  }
+
+  // Returned cached value if present
+  if (array_key_exists($name, $cache)) {
+    return $cache[$name];
+  }
+
+  // Get an LDAP server object.
+  $server = SimpleLdapServer::singleton();
+
+  // Handle special variables.
+  switch ($name) {
+    case 'simple_ldap_user_source':
+      // If the LDAP server is set to read-only, force LDAP->Drupal sync.
+      if ($server->readonly) {
+        return 'ldap';
+      }
+      break;
+
+    case 'simple_ldap_user_attribute_map':
+      // Load the attribute map from settings.php.
+      $attribute_map = variable_get($name, array());
+      // LDAP likes lowercase.
+      array_change_key_case($attribute_map, CASE_LOWER);
+      foreach ($attribute_map as $key => $value) {
+        // Make sure the Drupal attribute is an array.
+        if (!is_array($attribute_map[$key])) {
+          $attribute_map[$key] = array($value);
+        }
+      }
+
+      $cache[$name] = $attribute_map;
+      return $attribute_map;
+  }
+
+  // Define defaults that differ based on LDAP server type.
+  switch ($server->type) {
+    case 'Active Directory':
+      $defaults = array(
+        'simple_ldap_user_objectclass' => array('user'),
+        'simple_ldap_user_attribute_name' => 'samaccountname',
+        'simple_ldap_user_attribute_mail' => 'mail',
+        'simple_ldap_user_attribute_pass' => 'unicodepwd',
+        'simple_ldap_user_password_hash' => 'unicode',
+        'simple_ldap_user_attribute_rdn' => 'cn',
+      );
+      break;
+
+    default:
+      $defaults = array(
+        'simple_ldap_user_objectclass' => array('inetorgperson'),
+        'simple_ldap_user_attribute_name' => 'cn',
+        'simple_ldap_user_attribute_mail' => 'mail',
+        'simple_ldap_user_attribute_pass' => 'userpassword',
+        'simple_ldap_user_password_hash' => 'salted sha',
+      );
+  }
+
+  // Define defaults that do not depend on LDAP server type.
+  $defaults['simple_ldap_user_basedn'] = $server->basedn;
+  $defaults['simple_ldap_user_scope'] = 'sub';
+  $defaults['simple_ldap_user_source'] = 'ldap';
+  $defaults['simple_ldap_user_sync'] = 'hook_user_load';
+  $defaults['simple_ldap_user_delete_from_ldap'] = '1';
+  $defaults['simple_ldap_user_auth_fallback'] = array();
+  $defaults['simple_ldap_user_auth_fallback_writeback'] = array();
+  $defaults['simple_ldap_user_extra_attrs'] = array();
+  $defaults['simple_ldap_user_unique_attribute'] = '';
+
+  // Determine the default value for the given variable.
+  $default = isset($defaults[$name]) ? $defaults[$name] : $default;
+
+  if ($force_default) {
+    return $default;
+  }
+
+  return variable_get($name, $default);
+}

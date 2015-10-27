@@ -1,0 +1,16 @@
+name = Simple LDAP Role
+description = Simple LDAP role authorization
+package = LDAP
+core = 7.x
+configure = admin/config/people/simple_ldap/role
+dependencies[] = simple_ldap
+dependencies[] = simple_ldap_user
+files[] = simple_ldap_role.test
+files[] = SimpleLdapRole.class.php
+
+; Information added by Drupal.org packaging script on 2015-08-23
+version = "7.x-2.0-alpha2"
+core = "7.x"
+project = "simple_ldap"
+datestamp = "1440292440"
+

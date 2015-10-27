@@ -1,0 +1,132 @@
+<?php
+/**
+ * @file
+ * Main simple_ldap module file.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function simple_ldap_menu() {
+  $items = array();
+
+  $items['admin/config/people/simple_ldap'] = array(
+    'title' => 'Simple LDAP Configuration',
+    'description' => 'LDAP server, authentication parameters, roles, provisioning, etc.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('simple_ldap_admin'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'simple_ldap.admin.inc',
+  );
+
+  $items['admin/config/people/simple_ldap/server'] = array(
+    'title' => 'Server',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -1,
+  );
+
+  $items['admin/config/people/simple_ldap/server/settings'] = array(
+    'title' => 'Settings',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -1,
+  );
+
+  $items['admin/config/people/simple_ldap/server/debug'] = array(
+    'title' => 'Server Check',
+    'type' => MENU_LOCAL_TASK,
+    'page callback' => 'simple_ldap_server_check',
+    'access arguments' => array('administer site configuration'),
+    'file' => 'simple_ldap.admin.inc',
+  );
+
+  return $items;
+}
+
+function simple_ldap_init() {
+  global $conf;
+
+  // LDAP server connection parameters
+  $host = variable_get('simple_ldap_host', '');
+  $port = variable_get('simple_ldap_port', '389');
+  $starttls = variable_get('simple_ldap_starttls', FALSE);
+  $binddn = variable_get('simple_ldap_binddn', NULL);
+  $bindpw = variable_get('simple_ldap_bindpw', NULL);
+
+  if (empty($host) || empty($port)) {
+    return;
+  }
+
+  if ($ldap = ldap_connect($host, (int)$port)){
+    ldap_set_option($ldap, LDAP_OPT_PROTOCOL_VERSION, 3);
+    ldap_set_option($ldap, LDAP_OPT_REFERRALS, 0);
+    // TODO: Support StartTLS
+    if (@ldap_bind($ldap, $binddn, $bindpw)) {
+      ldap_unbind($ldap);
+      variable_set('simple_ldap_last_saw_ldap', time());
+      return;
+    }
+  }
+
+  $last_good = variable_get('simple_ldap_last_saw_ldap', 0);
+  $last_notify = variable_get('simple_ldap_last_down_notify', 0);
+  $notify_frequency = variable_get('simple_ldap_ldap_down_notify_frequency', '30');
+
+  // Send notifications
+  $recipients = trim(implode(',', explode("\n", variable_get('simple_ldap_ldap_down_notify_list', NULL))));
+  if (!empty($recipients)) {
+    // Send if we've just seen it go down, or if it's still down and
+    // it's been some number of minutes since the last cry for help.
+    if (($last_good > $last_notify) || ($notify_frequency && (time() > $last_notify + ($notify_frequency*60)))) {
+      drupal_mail('simple_ldap', 'ldap_down', $recipients, 'en');
+      variable_set('simple_ldap_last_down_notify', time());
+    }
+  }
+
+  // Optionally, put the site into maintenance mode.
+  if(variable_get('simple_ldap_ldap_down_maintenance_mode', TRUE)) {
+    // Set $conf directly so the site will automatically come back when LDAP 
+    // is restored.
+    $conf['maintenance_mode'] = 1;
+    $conf['maintenance_mode_message'] = variable_get('simple_ldap_ldap_down_message', t('The site is experiencing technical difficulties.'));
+  }
+
+  // Tell the admins LDAP is down.
+  if (user_access('access site in maintenance mode')) {
+    drupal_set_message(t('LDAP OFFLINE: Cannot connect to any LDAP servers. Check <a href="@ldap_config">the LDAP configuration</a>', array('@ldap_config' => url('admin/config/people/simple_ldap/server'))), 'error');
+  }
+}
+
+/**
+ * Implements hook_mail()
+ *
+ * Send a notification to a list of users when the LDAP server goes down.
+ */
+function simple_ldap_mail($key, &$message, $params) {
+  if ($key === 'ldap_down') {
+    $tokens = array('@website' => $_SERVER['SERVER_NAME']);
+    $message['body'][] = t('The site @website cannot connect to any LDAP servers.', $tokens);
+    $message['subject'] = t('LDAP DOWN ON @website', $tokens);
+  }
+}
+
+/**
+ * Returns whether simple_ldap has been configured.
+ */
+function simple_ldap_configured() {
+  $configured = TRUE;
+
+  // Check each of the required configuration items.
+  $configured = $configured && variable_get('simple_ldap_host') !== NULL;
+  $configured = $configured && variable_get('simple_ldap_port') !== NULL;
+
+  return $configured;
+}
+
+function simple_ldap_timestamp_to_ldap_time($ts) {
+  $tz = date_default_timezone_get();
+  date_default_timezone_set('UTC');
+  $ldap_time = date('YmdHis', $ts) . 'Z';
+  date_default_timezone_set($tz);
+
+  return $ldap_time;
+}

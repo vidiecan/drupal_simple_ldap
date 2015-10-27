@@ -1,0 +1,17 @@
+name = Simple LDAP User
+description = Simple LDAP user authentication
+package = LDAP
+dependencies[] = simple_ldap
+core = 7.x
+configure = admin/config/people/simple_ldap/user
+files[] = SimpleLdapUser.class.php
+files[] = SimpleLdapUserController.class.php
+files[] = simple_ldap_user.test
+files[] = simple_ldap_user.ldap_handlers.inc
+
+; Information added by Drupal.org packaging script on 2015-08-23
+version = "7.x-2.0-alpha2"
+core = "7.x"
+project = "simple_ldap"
+datestamp = "1440292440"
+

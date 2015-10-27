@@ -1,0 +1,19 @@
+#simple-ldap-debug-report tr {
+  border-bottom: 1px solid gray;
+}
+
+#simple-ldap-debug-report tr.ldap-test-warning {
+  background-color: orange;
+}
+
+#simple-ldap-debug-report tr.ldap-test-ok {
+  background-color: lightgreen;
+}
+
+#simple-ldap-debug-report tr.ldap-test-error {
+  background-color: pink;
+}
+
+#simple-ldap-debug-report tr.ldap-test-information {
+  background-color: lightblue;
+}
